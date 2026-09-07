@@ -176,12 +176,10 @@ const COLOR_CHOICES = [
   "#94493D", "#3E6B8C", "#6B8C3E",
 ];
 
-let virtualDayOffset = 0; // 仅用于原型里的"模拟新的一天"测试按钮
-
 function dayStr(offset) {
   const d = new Date();
   d.setHours(0, 0, 0, 0);
-  d.setDate(d.getDate() + offset + virtualDayOffset);
+  d.setDate(d.getDate() + offset);
   return d.toISOString().slice(0, 10);
 }
 
@@ -1262,6 +1260,7 @@ function makeInitialHabits() {
   return base.map((h) => ({
     ...h,
     lastDecayDate: dayStr(0),
+    lastNotifiedDate: null,
     identityVotes: 0,
   }));
 }
@@ -1317,6 +1316,26 @@ function avgAmount(history) {
   const values = Object.values(history).filter((v) => v > 0);
   if (values.length === 0) return 0;
   return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+// 真实的每日结算：应用打开时，回溯上次结算日期到今天之间，每个没打卡的日子扣一点认同
+function settleHabitDecay(habit) {
+  const today = dayStr(0);
+  if (habit.lastDecayDate === today) return { habit, missedDays: 0 };
+  let votes = habit.identityVotes;
+  let missedDays = 0;
+  const cursor = new Date(habit.lastDecayDate + "T00:00:00");
+  const end = new Date(today + "T00:00:00");
+  cursor.setDate(cursor.getDate() + 1);
+  while (cursor < end) {
+    const dateKey = cursor.toISOString().slice(0, 10);
+    if (!habit.history[dateKey]) {
+      votes = Math.max(0, votes - 1);
+      missedDays += 1;
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return { habit: { ...habit, identityVotes: votes, lastDecayDate: today }, missedDays };
 }
 
 // 判定机制：d20 骰子 + 技能修正值 + 当天打卡加成，对比事件的难度等级(DC)
@@ -1779,6 +1798,11 @@ function HabitChartCard({ habit, statPools, onEditCue }) {
 }
 
 function TaskRow({ task, onToggle, onDelete }) {
+  const today = dayStr(0);
+  const isOverdue = task.dueDate && !task.done && task.dueDate < today;
+  const isToday = task.dueDate === today;
+  const dueColor = isOverdue ? palette.clay : isToday ? palette.amber : palette.textMuted;
+
   return (
     <div
       style={{
@@ -1787,7 +1811,7 @@ function TaskRow({ task, onToggle, onDelete }) {
         gap: 10,
         padding: "10px 12px",
         borderRadius: 10,
-        border: `1px solid ${palette.line}`,
+        border: `1px solid ${isOverdue ? palette.clay : palette.line}`,
         background: palette.surface,
       }}
     >
@@ -1808,16 +1832,23 @@ function TaskRow({ task, onToggle, onDelete }) {
       >
         {task.done && <Check size={13} color={palette.bgDeep} />}
       </button>
-      <span
-        style={{
-          flex: 1,
-          fontSize: 14,
-          color: task.done ? palette.textMuted : palette.textMain,
-          textDecoration: task.done ? "line-through" : "none",
-        }}
-      >
-        {task.text}
-      </span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div
+          style={{
+            fontSize: 14,
+            color: task.done ? palette.textMuted : palette.textMain,
+            textDecoration: task.done ? "line-through" : "none",
+          }}
+        >
+          {task.text}
+        </div>
+        {task.dueDate && (
+          <div style={{ fontSize: 10, color: dueColor, marginTop: 2 }}>
+            {isOverdue ? "已逾期 · " : isToday ? "今天到期 · " : "截止 "}
+            {task.dueDate}
+          </div>
+        )}
+      </div>
       <button onClick={onDelete} style={{ background: "none", border: "none", color: palette.textMuted, cursor: "pointer", padding: 2 }}>
         <Trash2 size={14} />
       </button>
@@ -1950,6 +1981,7 @@ export default function HabitJournalApp() {
     ])
   );
   const [newTaskText, setNewTaskText] = useState("");
+  const [newTaskDue, setNewTaskDue] = useState("");
   const [activePage, setActivePage] = useState(0);
   const [aspiredIdentity, setAspiredIdentity] = useState(() => loadSaved("hj_aspired", "健康的人"));
 
@@ -2059,26 +2091,62 @@ export default function HabitJournalApp() {
 
   const [decayNotice, setDecayNotice] = useState([]);
 
-  function simulateNewDay() {
-    virtualDayOffset += 1;
-    const missedDate = dayStr(-1);
+  const [notifPermission, setNotifPermission] = useState(
+    typeof Notification !== "undefined" ? Notification.permission : "unsupported"
+  );
+
+  function requestNotifPermission() {
+    if (typeof Notification === "undefined") {
+      setNotifPermission("unsupported");
+      return;
+    }
+    Notification.requestPermission().then(setNotifPermission);
+  }
+
+  useEffect(() => {
+    if (typeof Notification === "undefined") return;
+    const interval = setInterval(() => {
+      if (Notification.permission !== "granted") return;
+      const now = new Date();
+      const nowStr = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+      const today = dayStr(0);
+      setHabits((prev) =>
+        prev.map((h) => {
+          if (h.time === nowStr && h.lastNotifiedDate !== today) {
+            try {
+              new Notification("习惯图鉴", {
+                body: h.cue ? `在${h.cue}之后，该"${h.name}"了` : `该"${h.name}"了`,
+              });
+            } catch {}
+            return { ...h, lastNotifiedDate: today };
+          }
+          return h;
+        })
+      );
+    }, 20000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const [decaySettled, setDecaySettled] = useState(false);
+
+  useEffect(() => {
+    if (decaySettled) return;
     const notices = [];
     setHabits((prev) =>
       prev.map((h) => {
-        if (!h.history[missedDate] && h.lastDecayDate !== missedDate) {
-          notices.push(`昨天没能完成"${h.name}"，对"${h.identity}"的认同 -1（${h.stat}不受影响）`);
-          return {
-            ...h,
-            identityVotes: Math.max(0, h.identityVotes - 1),
-            lastDecayDate: missedDate,
-          };
+        const { habit: settled, missedDays } = settleHabitDecay(h);
+        if (missedDays > 0) {
+          notices.push(`距离上次打开，"${h.name}"有 ${missedDays} 天没打卡，对"${h.identity}"的认同 -${missedDays}（${h.stat}不受影响）`);
         }
-        return { ...h, lastDecayDate: missedDate };
+        return settled;
       })
     );
-    setDecayNotice(notices);
-    setTimeout(() => setDecayNotice([]), 4000);
-  }
+    if (notices.length > 0) {
+      setDecayNotice(notices);
+      setTimeout(() => setDecayNotice([]), 6000);
+    }
+    setDecaySettled(true);
+  }, [decaySettled]);
 
   function handleAddHabit() {
     if (!newHabit.name.trim()) return;
@@ -2098,6 +2166,7 @@ export default function HabitJournalApp() {
         unit: "分钟",
         history: {},
         lastDecayDate: dayStr(0),
+        lastNotifiedDate: null,
         identityVotes: 0,
       },
     ]);
@@ -2114,8 +2183,9 @@ export default function HabitJournalApp() {
 
   function addTask() {
     if (!newTaskText.trim()) return;
-    setTasks((prev) => [...prev, { id: `task_${Date.now()}`, text: newTaskText.trim(), done: false }]);
+    setTasks((prev) => [...prev, { id: `task_${Date.now()}`, text: newTaskText.trim(), done: false, dueDate: newTaskDue || null }]);
     setNewTaskText("");
+    setNewTaskDue("");
   }
 
   const TASK_CHEERS = ["搞定！", "又划掉一件事～", "干得漂亮", "利落！", "这一项，收工"];
@@ -2314,6 +2384,12 @@ export default function HabitJournalApp() {
               placeholder="添加一件待办事项"
               style={{ flex: 1, background: palette.surface, border: `1px solid ${palette.line}`, borderRadius: 8, padding: "9px 12px", color: palette.textMain, fontSize: 13 }}
             />
+            <input
+              type="date"
+              value={newTaskDue}
+              onChange={(e) => setNewTaskDue(e.target.value)}
+              style={{ background: palette.surface, border: `1px solid ${palette.line}`, borderRadius: 8, padding: "9px 8px", color: palette.textMain, fontSize: 12 }}
+            />
             <button
               onClick={addTask}
               style={{ padding: "9px 16px", borderRadius: 8, border: "none", background: palette.moss, color: palette.bgDeep, fontWeight: 600, fontSize: 13, cursor: "pointer" }}
@@ -2322,9 +2398,13 @@ export default function HabitJournalApp() {
             </button>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {tasks.filter((t) => !t.done).map((t) => (
-              <TaskRow key={t.id} task={t} onToggle={() => toggleTask(t.id)} onDelete={() => deleteTask(t.id)} />
-            ))}
+            {tasks
+              .filter((t) => !t.done)
+              .slice()
+              .sort((a, b) => (a.dueDate || "9999") < (b.dueDate || "9999") ? -1 : 1)
+              .map((t) => (
+                <TaskRow key={t.id} task={t} onToggle={() => toggleTask(t.id)} onDelete={() => deleteTask(t.id)} />
+              ))}
           </div>
           {tasks.some((t) => t.done) && (
             <div style={{ marginTop: 18 }}>
@@ -2347,11 +2427,22 @@ export default function HabitJournalApp() {
               习惯
             </div>
             <button
-              onClick={simulateNewDay}
-              title="测试用：模拟过完一天，检查是否有遗漏的打卡"
-              style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 10px", borderRadius: 999, border: `1px dashed ${palette.line}`, background: "transparent", color: palette.textMuted, fontSize: 11, cursor: "pointer" }}
+              onClick={requestNotifPermission}
+              title={notifPermission === "granted" ? "提醒通知已开启" : "点击开启提醒通知（需要保持浏览器/网页开着）"}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+                padding: "6px 10px",
+                borderRadius: 999,
+                border: `1px dashed ${notifPermission === "granted" ? palette.moss : palette.line}`,
+                background: "transparent",
+                color: notifPermission === "granted" ? palette.moss : palette.textMuted,
+                fontSize: 11,
+                cursor: notifPermission === "granted" ? "default" : "pointer",
+              }}
             >
-              ⏭ 模拟新的一天（测试）
+              {notifPermission === "granted" ? "🔔 提醒已开启" : notifPermission === "denied" ? "🔕 提醒被拒绝" : "🔔 开启提醒通知"}
             </button>
           </div>
           {decayNotice.length > 0 && (
