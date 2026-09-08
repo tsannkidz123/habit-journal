@@ -212,6 +212,10 @@ function buildHistory({ seed, days, prob, tailFlags, minMinutes, maxMinutes, bin
 
 // ---------- 共享事件池：所有习惯的打卡都从这里抽事件，每个事件的判定绑定一个具体数值 ----------
 const OPTION_STATS = { negotiate: "智慧", face: "心灵", conflict: "力量" };
+const CORE_STATS = ["智慧", "力量", "心灵"];
+function customStatsOf(stats) {
+  return stats.filter((s) => !CORE_STATS.includes(s));
+}
 const CONFLICT_DC_BONUS = 3;
 const CHAPTER_LENGTH = 15;
 const TOTAL_CHAPTERS = 10;
@@ -1413,7 +1417,7 @@ const OPTION_META = {
   conflict: { icon: Swords, dcBonus: CONFLICT_DC_BONUS, heroGain: 2, archetype: "冲突" },
 };
 
-function EventCard({ event, statPools, lastCheckinBonus, color, onRoll, onApplyRoll, onAvoid, lastGain }) {
+function EventCard({ event, statPools, lastCheckinBonus, color, onRoll, onApplyRoll, onAvoid, lastGain, customStat }) {
   const ev = event;
   const [rolling, setRolling] = useState(false);
   const [displayRoll, setDisplayRoll] = useState(null);
@@ -1486,13 +1490,13 @@ function EventCard({ event, statPools, lastCheckinBonus, color, onRoll, onApplyR
         判定成功才算数，失败这一轮就白费；逃避保证不白费，但拿不到更好的倾向。
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {["negotiate", "face", "conflict"].map((kind) => {
-          const opt = ev[kind];
-          const meta = OPTION_META[kind];
+        {["negotiate", "face", "conflict", ...(customStat ? ["custom"] : [])].map((kind) => {
+          const opt = kind === "custom" ? { label: `运用"${customStat}"来解决` } : ev[kind];
+          const meta = kind === "custom" ? { icon: Target, dcBonus: 0, heroGain: 1, archetype: "自定义" } : OPTION_META[kind];
           const Icon = meta.icon;
           const need = ev.need + meta.dcBonus;
           const dc = difficultyOf(need);
-          const stat = OPTION_STATS[kind];
+          const stat = kind === "custom" ? customStat : OPTION_STATS[kind];
           const points = statPools[stat] || 0;
           const statMod = Math.floor(points / 2);
           const checkinBonus = 2 + (lastCheckinBonus ? 1 : 0);
@@ -1554,7 +1558,7 @@ function EventCard({ event, statPools, lastCheckinBonus, color, onRoll, onApplyR
 }
 
 
-function AdventurePanel({ story, statPools, habit, onCheckin, onRoll, onApplyRoll, onAvoid, onContinueStory }) {
+function AdventurePanel({ story, statPools, habit, customStat, onCheckin, onRoll, onApplyRoll, onAvoid, onContinueStory }) {
   const [amount, setAmount] = useState("");
   const showEndingCard = story.progress >= FINAL_THRESHOLD && !story.endingShown && !story.pendingEvent;
   const endingType = story.heroPoints >= story.otherPoints ? "hero" : "quiet";
@@ -1611,6 +1615,7 @@ function AdventurePanel({ story, statPools, habit, onCheckin, onRoll, onApplyRol
             lastCheckinBonus={story.lastCheckinBonus}
             lastGain={story.lastGain}
             color={habit.color}
+            customStat={customStat}
             onRoll={onRoll}
             onApplyRoll={onApplyRoll}
             onAvoid={onAvoid}
@@ -1885,11 +1890,17 @@ function IdentityTick({ x, y, payload, textAnchor, aspiredIdentity, onPick }) {
   );
 }
 
+const IDENTITY_TIER_THRESHOLDS = [5, 15, 30];
+const IDENTITY_TIER_LABELS = ["初现雏形", "渐成形状", "身份稳固", "深入骨子里"];
+function tierOf(votes) {
+  return IDENTITY_TIER_THRESHOLDS.filter((t) => votes >= t).length;
+}
+
 function CharacterProfileCard({ tally, aspiredIdentity, identities, onPick }) {
   const aspiredVotes = tally[aspiredIdentity] || 0;
-  const tierThresholds = [5, 15, 30];
-  const tier = tierThresholds.filter((t) => aspiredVotes >= t).length;
-  const tierLabel = ["初现雏形", "渐成形状", "身份稳固", "深入骨子里"][tier];
+  const tierThresholds = IDENTITY_TIER_THRESHOLDS;
+  const tier = tierOf(aspiredVotes);
+  const tierLabel = IDENTITY_TIER_LABELS[tier];
   const pct = Math.min(100, Math.round((aspiredVotes / tierThresholds[tierThresholds.length - 1]) * 100));
   const radarData = identities.map((name) => ({ identity: name, value: tally[name] || 0 }));
 
@@ -2023,6 +2034,30 @@ export default function HabitJournalApp() {
     [habits]
   );
 
+  const [knownTiers, setKnownTiers] = useState(() => loadSaved("hj_tiers", {}));
+  const [celebration, setCelebration] = useState(null);
+
+  useEffect(() => {
+    localStorage.setItem("hj_tiers", JSON.stringify(knownTiers));
+  }, [knownTiers]);
+
+  useEffect(() => {
+    const updates = {};
+    let toCelebrate = null;
+    Object.entries(identityTally).forEach(([idn, votes]) => {
+      const newTier = tierOf(votes);
+      const oldTier = knownTiers[idn] || 0;
+      if (newTier > oldTier) {
+        updates[idn] = newTier;
+        toCelebrate = { identity: idn, tierLabel: IDENTITY_TIER_LABELS[newTier] };
+      }
+    });
+    if (Object.keys(updates).length > 0) {
+      setKnownTiers((prev) => ({ ...prev, ...updates }));
+      setCelebration(toCelebrate);
+    }
+  }, [identityTally]);
+
   function updateSelected(fn) {
     setHabits((prev) => prev.map((h) => (h.id === selectedId ? fn(h) : h)));
   }
@@ -2051,9 +2086,12 @@ export default function HabitJournalApp() {
     }));
   }
 
+  const activeCustomStats = customStatsOf(stats);
+  const currentCustomStat = activeCustomStats.length ? activeCustomStats[activeCustomStats.length - 1] : null;
+
   function computeRoll(kind) {
     const ev = story.pendingEvent;
-    const stat = OPTION_STATS[kind];
+    const stat = kind === "custom" ? currentCustomStat : OPTION_STATS[kind];
     const need = ev.need + (kind === "conflict" ? CONFLICT_DC_BONUS : 0);
     return rollCheck(statPools, stat, need, story.lastCheckinBonus);
   }
@@ -2061,9 +2099,13 @@ export default function HabitJournalApp() {
   function applyRollResult(kind, r) {
     setStory((prev) => {
       const ev = prev.pendingEvent;
-      const opt = ev[kind];
+      const opt =
+        kind === "custom"
+          ? { success: `你灵活地运用"${currentCustomStat}"，用自己的方式解决了这个问题。`, fail: "这次的尝试没能奏效，你决定换个办法应对。" }
+          : ev[kind];
       const heroGain = r.passed ? (kind === "conflict" ? 2 : 1) : 0;
-      const resultText = `\u{1F3B2} ${r.roll} + ${r.statMod + r.checkinBonus}（${OPTION_STATS[kind]}+今日加成） = ${r.total}，难度 ${r.dc} → ${r.passed ? "成功" : "失败"}。${r.passed ? opt.success : opt.fail}`;
+      const statLabel = kind === "custom" ? currentCustomStat : OPTION_STATS[kind];
+      const resultText = `\u{1F3B2} ${r.roll} + ${r.statMod + r.checkinBonus}（${statLabel}+今日加成） = ${r.total}，难度 ${r.dc} → ${r.passed ? "成功" : "失败"}。${r.passed ? opt.success : opt.fail}`;
       return {
         ...prev,
         pendingEvent: null,
@@ -2147,6 +2189,39 @@ export default function HabitJournalApp() {
     }
     setDecaySettled(true);
   }, [decaySettled]);
+
+  const STORAGE_KEYS = ["hj_habits", "hj_tasks", "hj_aspired", "hj_stats", "hj_statpools", "hj_story"];
+
+  function exportData() {
+    const data = {};
+    STORAGE_KEYS.forEach((k) => {
+      const v = localStorage.getItem(k);
+      if (v) data[k] = v;
+    });
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `habit-journal-backup-${dayStr(0)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function importData(file) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        STORAGE_KEYS.forEach((k) => {
+          if (data[k]) localStorage.setItem(k, data[k]);
+        });
+        window.location.reload();
+      } catch {
+        alert("这个文件看起来不是有效的备份文件，导入失败。");
+      }
+    };
+    reader.readAsText(file);
+  }
 
   function handleAddHabit() {
     if (!newHabit.name.trim()) return;
@@ -2336,7 +2411,7 @@ export default function HabitJournalApp() {
             <span style={{ fontSize: 14, fontFamily: "'IBM Plex Sans', sans-serif" }}>{streak}</span>
           </div>
 
-          <AdventurePanel story={story} statPools={statPools} habit={selected} onCheckin={handleCheckin} onRoll={computeRoll} onApplyRoll={applyRollResult} onAvoid={resolveAvoid} onContinueStory={continueStory} />
+          <AdventurePanel story={story} statPools={statPools} habit={selected} customStat={currentCustomStat} onCheckin={handleCheckin} onRoll={computeRoll} onApplyRoll={applyRollResult} onAvoid={resolveAvoid} onContinueStory={continueStory} />
 
           <SectionDivider />
           <div style={{ paddingTop: 2 }}>
@@ -2422,10 +2497,10 @@ export default function HabitJournalApp() {
         {/* 页面3：习惯图表 */}
         {activePage === 2 && (
         <div style={{ padding: "18px 20px" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
-            <div className="hj-serif" style={{ fontSize: 18, fontWeight: 600 }}>
-              习惯
-            </div>
+          <div className="hj-serif" style={{ fontSize: 18, fontWeight: 600, marginBottom: 10 }}>
+            习惯
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
             <button
               onClick={requestNotifPermission}
               title={notifPermission === "granted" ? "提醒通知已开启" : "点击开启提醒通知（需要保持浏览器/网页开着）"}
@@ -2444,6 +2519,29 @@ export default function HabitJournalApp() {
             >
               {notifPermission === "granted" ? "🔔 提醒已开启" : notifPermission === "denied" ? "🔕 提醒被拒绝" : "🔔 开启提醒通知"}
             </button>
+            <button
+              onClick={exportData}
+              title="把所有数据导出成一个文件，可用于备份或搬到别的设备"
+              style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 10px", borderRadius: 999, border: `1px dashed ${palette.line}`, background: "transparent", color: palette.textMuted, fontSize: 11, cursor: "pointer" }}
+            >
+              ⬇ 导出数据
+            </button>
+            <button
+              onClick={() => document.getElementById("hj-import-input").click()}
+              title="从之前导出的备份文件里读回数据"
+              style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 10px", borderRadius: 999, border: `1px dashed ${palette.line}`, background: "transparent", color: palette.textMuted, fontSize: 11, cursor: "pointer" }}
+            >
+              ⬆ 导入数据
+            </button>
+            <input
+              id="hj-import-input"
+              type="file"
+              accept="application/json"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                if (e.target.files && e.target.files[0]) importData(e.target.files[0]);
+              }}
+            />
           </div>
           {decayNotice.length > 0 && (
             <div style={{ marginBottom: 14, display: "flex", flexDirection: "column", gap: 4 }}>
@@ -2472,6 +2570,7 @@ export default function HabitJournalApp() {
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
             {CHARACTERS.map((c) => {
               const state = characterState(c, story.progress);
+              const avatarColor = COLOR_CHOICES[c.chapter % COLOR_CHOICES.length];
               return (
                 <div
                   key={c.id}
@@ -2485,13 +2584,34 @@ export default function HabitJournalApp() {
                 >
                   {state === "locked" ? (
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", color: palette.textMuted, gap: 6, paddingTop: 8 }}>
-                      <Lock size={16} />
+                      <div style={{ width: 34, height: 34, borderRadius: "50%", background: palette.line, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                        <Lock size={15} color={palette.textMuted} />
+                      </div>
                       <span style={{ fontSize: 12 }}>？？？</span>
                     </div>
                   ) : (
                     <>
-                      <div className="hj-serif" style={{ fontSize: 14, fontWeight: 600, marginBottom: 4, color: palette.leather }}>
-                        {c.name}
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                        <div
+                          style={{
+                            width: 34,
+                            height: 34,
+                            borderRadius: "50%",
+                            background: `${avatarColor}33`,
+                            border: `1.5px solid ${avatarColor}`,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            flexShrink: 0,
+                          }}
+                        >
+                          <span className="hj-serif" style={{ fontSize: 15, fontWeight: 700, color: avatarColor }}>
+                            {c.name[0]}
+                          </span>
+                        </div>
+                        <div className="hj-serif" style={{ fontSize: 14, fontWeight: 600, color: palette.leather }}>
+                          {c.name}
+                        </div>
                       </div>
                       <div style={{ fontSize: 12, color: palette.textMain, lineHeight: 1.5 }}>
                         {state === "full" ? c.bio : c.brief}
@@ -2537,6 +2657,40 @@ export default function HabitJournalApp() {
           </button>
         ))}
       </div>
+
+      {celebration && (
+        <div
+          onClick={() => setCelebration(null)}
+          style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "center", justifyContent: "center", borderRadius: 16, zIndex: 10 }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: palette.surfaceRaised,
+              border: `2px solid ${palette.leather}`,
+              borderRadius: 16,
+              padding: "28px 26px",
+              width: 260,
+              textAlign: "center",
+              position: "relative",
+              animation: "hj-dice-spin 0s",
+            }}
+          >
+            <div style={{ fontSize: 32, marginBottom: 8 }}>🎉</div>
+            <div style={{ fontSize: 11, color: palette.textMuted, marginBottom: 6 }}>身份认同升级</div>
+            <div className="hj-serif" style={{ fontSize: 18, fontWeight: 700, color: palette.leather, marginBottom: 4 }}>
+              {celebration.identity}
+            </div>
+            <div style={{ fontSize: 14, color: palette.textMain, marginBottom: 18 }}>{celebration.tierLabel}</div>
+            <button
+              onClick={() => setCelebration(null)}
+              style={{ padding: "8px 20px", borderRadius: 999, border: "none", background: palette.leather, color: palette.surfaceRaised, fontWeight: 600, fontSize: 13, cursor: "pointer" }}
+            >
+              太棒了
+            </button>
+          </div>
+        </div>
+      )}
 
       {showAddModal && (
         <div onClick={() => setShowAddModal(false)} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", borderRadius: 16 }}>
